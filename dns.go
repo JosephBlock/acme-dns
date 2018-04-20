@@ -65,6 +65,7 @@ func answer(q dns.Question) ([]dns.RR, int, error) {
 func handleRequest(w dns.ResponseWriter, r *dns.Msg) {
 	m := new(dns.Msg)
 	m.SetReply(r)
+	m.Authoritative = true
 
 	if r.Opcode == dns.OpcodeQuery {
 		readQuery(m)
