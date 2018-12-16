@@ -2,6 +2,7 @@ package main
 
 import (
 	"crypto/rand"
+	"errors"
 	"fmt"
 	"math/big"
 	"os"
@@ -9,7 +10,6 @@ import (
 	"strings"
 
 	"github.com/BurntSushi/toml"
-	"github.com/miekg/dns"
 	log "github.com/sirupsen/logrus"
 )
 
@@ -17,19 +17,44 @@ func jsonError(message string) []byte {
 	return []byte(fmt.Sprintf("{\"error\": \"%s\"}", message))
 }
 
-func fileExists(fname string) bool {
+func fileIsAccessible(fname string) bool {
 	_, err := os.Stat(fname)
 	if err != nil {
 		return false
 	}
+	f, err := os.Open(fname)
+	if err != nil {
+		return false
+	}
+	f.Close()
 	return true
 }
 
-func readConfig(fname string) DNSConfig {
+func readConfig(fname string) (DNSConfig, error) {
 	var conf DNSConfig
-	// Practically never errors
-	_, _ = toml.DecodeFile(fname, &conf)
-	return conf
+	_, err := toml.DecodeFile(fname, &conf)
+	if err != nil {
+		// Return with config file parsing errors from toml package
+		return conf, err
+	}
+	return prepareConfig(conf)
+}
+
+// prepareConfig checks that mandatory values exist, and can be used to set default values in the future
+func prepareConfig(conf DNSConfig) (DNSConfig, error) {
+	if conf.Database.Engine == "" {
+		return conf, errors.New("missing database configuration option \"engine\"")
+	}
+	if conf.Database.Connection == "" {
+		return conf, errors.New("missing database configuration option \"connection\"")
+	}
+
+	// Default values for options added to config to keep backwards compatibility with old config
+	if conf.API.ACMECacheDir == "" {
+		conf.API.ACMECacheDir = "api-certs"
+	}
+
+	return conf, nil
 }
 
 func sanitizeString(s string) string {
@@ -80,14 +105,6 @@ func setupLogging(format string, level string) {
 		log.SetLevel(log.ErrorLevel)
 	}
 	// TODO: file logging
-}
-
-func startDNS(listen string, proto string) *dns.Server {
-	// DNS server part
-	dns.HandleFunc(".", handleRequest)
-	server := &dns.Server{Addr: listen, Net: proto}
-	go server.ListenAndServe()
-	return server
 }
 
 func getIPListFromHeader(header string) []string {

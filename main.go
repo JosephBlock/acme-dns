@@ -4,25 +4,40 @@ package main
 
 import (
 	"crypto/tls"
+	"flag"
 	stdlog "log"
 	"net/http"
 	"os"
+	"strings"
+	"syscall"
 
 	"github.com/julienschmidt/httprouter"
+	"github.com/miekg/dns"
 	"github.com/rs/cors"
 	log "github.com/sirupsen/logrus"
 	"golang.org/x/crypto/acme/autocert"
 )
 
 func main() {
+	// Created files are not world writable
+	syscall.Umask(0077)
+	configPtr := flag.String("c", "/etc/acme-dns/config.cfg", "config file location")
+	flag.Parse()
 	// Read global config
-	if fileExists("/etc/acme-dns/config.cfg") {
-		Config = readConfig("/etc/acme-dns/config.cfg")
-		log.WithFields(log.Fields{"file": "/etc/acme-dns/config.cfg"}).Info("Using config file")
-
-	} else {
+	var err error
+	if fileIsAccessible(*configPtr) {
+		log.WithFields(log.Fields{"file": *configPtr}).Info("Using config file")
+		Config, err = readConfig(*configPtr)
+	} else if fileIsAccessible("./config.cfg") {
 		log.WithFields(log.Fields{"file": "./config.cfg"}).Info("Using config file")
-		Config = readConfig("config.cfg")
+		Config, err = readConfig("./config.cfg")
+	} else {
+		log.Errorf("Configuration file not found.")
+		os.Exit(1)
+	}
+	if err != nil {
+		log.Errorf("Encountered an error while trying to read configuration file:  %s", err)
+		os.Exit(1)
 	}
 
 	setupLogging(Config.Logconfig.Format, Config.Logconfig.Level)
@@ -32,7 +47,7 @@ func main() {
 
 	// Open database
 	newDB := new(acmedb)
-	err := newDB.Init(Config.Database.Engine, Config.Database.Connection)
+	err = newDB.Init(Config.Database.Engine, Config.Database.Connection)
 	if err != nil {
 		log.Errorf("Could not open database [%v]", err)
 		os.Exit(1)
@@ -42,16 +57,58 @@ func main() {
 	DB = newDB
 	defer DB.Close()
 
+	// Error channel for servers
+	errChan := make(chan error, 1)
+
 	// DNS server
-	startDNS(Config.General.Listen, Config.General.Proto)
+	if strings.HasPrefix(Config.General.Proto, "both") {
+		// Handle the case where DNS server should be started for both udp and tcp
+		udpProto := "udp"
+		tcpProto := "tcp"
+		if strings.HasSuffix(Config.General.Proto, "4") {
+			udpProto += "4"
+			tcpProto += "4"
+		} else if strings.HasSuffix(Config.General.Proto, "6") {
+			udpProto += "6"
+			tcpProto += "6"
+		}
+		dnsServerUDP := setupDNSServer(udpProto)
+		dnsServerTCP := setupDNSServer(tcpProto)
+		go startDNS(dnsServerUDP, errChan)
+		go startDNS(dnsServerTCP, errChan)
+	} else {
+		dnsServer := setupDNSServer(Config.General.Proto)
+		go startDNS(dnsServer, errChan)
+	}
 
 	// HTTP API
-	startHTTPAPI()
+	go startHTTPAPI(errChan)
 
+	// block waiting for error
+	select {
+	case err = <-errChan:
+		if err != nil {
+			log.Fatal(err)
+		}
+	}
 	log.Debugf("Shutting down...")
 }
 
-func startHTTPAPI() {
+func startDNS(server *dns.Server, errChan chan error) {
+	// DNS server part
+	dns.HandleFunc(".", handleRequest)
+	log.WithFields(log.Fields{"addr": Config.General.Listen, "proto": server.Net}).Info("Listening DNS")
+	err := server.ListenAndServe()
+	if err != nil {
+		errChan <- err
+	}
+}
+
+func setupDNSServer(proto string) *dns.Server {
+	return &dns.Server{Addr: Config.General.Listen, Net: proto}
+}
+
+func startHTTPAPI(errChan chan error) {
 	// Setup http logger
 	logger := log.New()
 	logwriter := logger.Writer()
@@ -77,11 +134,11 @@ func startHTTPAPI() {
 	cfg := &tls.Config{
 		MinVersion: tls.VersionTLS12,
 	}
-
+	var err error
 	switch Config.API.TLS {
 	case "letsencrypt":
 		m := autocert.Manager{
-			Cache:      autocert.DirCache("api-certs"),
+			Cache:      autocert.DirCache(Config.API.ACMECacheDir),
 			Prompt:     autocert.AcceptTOS,
 			HostPolicy: autocert.HostWhitelist(Config.API.Domain),
 		}
@@ -96,7 +153,7 @@ func startHTTPAPI() {
 			ErrorLog:  stdlog.New(logwriter, "", 0),
 		}
 		log.WithFields(log.Fields{"host": host, "domain": Config.API.Domain}).Info("Listening HTTPS, using certificate from autocert")
-		log.Fatal(srv.ListenAndServeTLS("", ""))
+		err = srv.ListenAndServeTLS("", "")
 	case "cert":
 		srv := &http.Server{
 			Addr:      host,
@@ -105,9 +162,12 @@ func startHTTPAPI() {
 			ErrorLog:  stdlog.New(logwriter, "", 0),
 		}
 		log.WithFields(log.Fields{"host": host}).Info("Listening HTTPS")
-		log.Fatal(srv.ListenAndServeTLS(Config.API.TLSCertFullchain, Config.API.TLSCertPrivkey))
+		err = srv.ListenAndServeTLS(Config.API.TLSCertFullchain, Config.API.TLSCertPrivkey)
 	default:
 		log.WithFields(log.Fields{"host": host}).Info("Listening HTTP")
-		log.Fatal(http.ListenAndServe(host, c.Handler(api)))
+		err = http.ListenAndServe(host, c.Handler(api))
+	}
+	if err != nil {
+		errChan <- err
 	}
 }
