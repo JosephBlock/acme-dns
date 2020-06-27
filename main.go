@@ -11,11 +11,12 @@ import (
 	"strings"
 	"syscall"
 
+	"github.com/go-acme/lego/v3/challenge/dns01"
+	legolog "github.com/go-acme/lego/v3/log"
 	"github.com/julienschmidt/httprouter"
-	"github.com/miekg/dns"
+	"github.com/mholt/certmagic"
 	"github.com/rs/cors"
 	log "github.com/sirupsen/logrus"
-	"golang.org/x/crypto/acme/autocert"
 )
 
 func main() {
@@ -42,9 +43,6 @@ func main() {
 
 	setupLogging(Config.Logconfig.Format, Config.Logconfig.Level)
 
-	// Read the default records in
-	RR.Parse(Config.General)
-
 	// Open database
 	newDB := new(acmedb)
 	err = newDB.Init(Config.Database.Engine, Config.Database.Connection)
@@ -61,6 +59,7 @@ func main() {
 	errChan := make(chan error, 1)
 
 	// DNS server
+	dnsservers := make([]*DNSServer, 0)
 	if strings.HasPrefix(Config.General.Proto, "both") {
 		// Handle the case where DNS server should be started for both udp and tcp
 		udpProto := "udp"
@@ -72,17 +71,25 @@ func main() {
 			udpProto += "6"
 			tcpProto += "6"
 		}
-		dnsServerUDP := setupDNSServer(udpProto)
-		dnsServerTCP := setupDNSServer(tcpProto)
-		go startDNS(dnsServerUDP, errChan)
-		go startDNS(dnsServerTCP, errChan)
+		dnsServerUDP := NewDNSServer(DB, Config.General.Listen, udpProto, Config.General.Domain)
+		dnsservers = append(dnsservers, dnsServerUDP)
+		dnsServerUDP.ParseRecords(Config)
+		dnsServerTCP := NewDNSServer(DB, Config.General.Listen, tcpProto, Config.General.Domain)
+		dnsservers = append(dnsservers, dnsServerTCP)
+		// No need to parse records from config again
+		dnsServerTCP.Domains = dnsServerUDP.Domains
+		dnsServerTCP.SOA = dnsServerUDP.SOA
+		go dnsServerUDP.Start(errChan)
+		go dnsServerTCP.Start(errChan)
 	} else {
-		dnsServer := setupDNSServer(Config.General.Proto)
-		go startDNS(dnsServer, errChan)
+		dnsServer := NewDNSServer(DB, Config.General.Listen, Config.General.Proto, Config.General.Domain)
+		dnsservers = append(dnsservers, dnsServer)
+		dnsServer.ParseRecords(Config)
+		go dnsServer.Start(errChan)
 	}
 
 	// HTTP API
-	go startHTTPAPI(errChan)
+	go startHTTPAPI(errChan, Config, dnsservers)
 
 	// block waiting for error
 	select {
@@ -94,25 +101,17 @@ func main() {
 	log.Debugf("Shutting down...")
 }
 
-func startDNS(server *dns.Server, errChan chan error) {
-	// DNS server part
-	dns.HandleFunc(".", handleRequest)
-	log.WithFields(log.Fields{"addr": Config.General.Listen, "proto": server.Net}).Info("Listening DNS")
-	err := server.ListenAndServe()
-	if err != nil {
-		errChan <- err
-	}
-}
-
-func setupDNSServer(proto string) *dns.Server {
-	return &dns.Server{Addr: Config.General.Listen, Net: proto}
-}
-
-func startHTTPAPI(errChan chan error) {
+func startHTTPAPI(errChan chan error, config DNSConfig, dnsservers []*DNSServer) {
 	// Setup http logger
 	logger := log.New()
 	logwriter := logger.Writer()
 	defer logwriter.Close()
+	// Setup logging for different dependencies to log with logrus
+	// Certmagic
+	stdlog.SetOutput(logwriter)
+	// Lego
+	legolog.Logger = logger
+
 	api := httprouter.New()
 	c := cors.New(cors.Options{
 		AllowedOrigins:     Config.API.CorsOrigins,
@@ -128,31 +127,72 @@ func startHTTPAPI(errChan chan error) {
 		api.POST("/register", webRegisterPost)
 	}
 	api.POST("/update", Auth(webUpdatePost))
+	api.GET("/health", healthCheck)
 
 	host := Config.API.IP + ":" + Config.API.Port
 
+	// TLS specific general settings
 	cfg := &tls.Config{
 		MinVersion: tls.VersionTLS12,
 	}
+
+	provider := NewChallengeProvider(dnsservers)
+	// Override the validation options to mitigate issues with (lack of) 1:1 nat reflection
+	// for some network setups.
+	dnsopts := dns01.WrapPreCheck(func(_, _, _ string, _ dns01.PreCheckFunc) (bool, error) {
+		return true, nil
+	})
+	storage := certmagic.FileStorage{Path: Config.API.ACMECacheDir}
+	magicconf := certmagic.Config{
+		Agreed:             true,
+		CA:                 certmagic.LetsEncryptStagingCA,
+		DNSProvider:        &provider,
+		DNSChallengeOption: dnsopts,
+		DefaultServerName:  Config.General.Domain,
+		Storage:            &storage,
+	}
+
+	cache := certmagic.NewCache(certmagic.CacheOptions{
+		GetConfigForCert: func(cert certmagic.Certificate) (certmagic.Config, error) {
+			return magicconf, nil
+		},
+	})
+
 	var err error
 	switch Config.API.TLS {
-	case "letsencrypt":
-		m := autocert.Manager{
-			Cache:      autocert.DirCache(Config.API.ACMECacheDir),
-			Prompt:     autocert.AcceptTOS,
-			HostPolicy: autocert.HostWhitelist(Config.API.Domain),
+	case "letsencryptstaging":
+		magicconf.CA = certmagic.LetsEncryptStagingCA
+		certcfg := certmagic.New(cache, magicconf)
+		err = certcfg.ManageSync([]string{Config.General.Domain})
+		if err != nil {
+			errChan <- err
+			return
 		}
-		autocerthost := Config.API.IP + ":" + Config.API.AutocertPort
-		log.WithFields(log.Fields{"autocerthost": autocerthost, "domain": Config.API.Domain}).Debug("Opening HTTP port for autocert")
-		go http.ListenAndServe(autocerthost, m.HTTPHandler(nil))
-		cfg.GetCertificate = m.GetCertificate
+		cfg.GetCertificate = certcfg.GetCertificate
 		srv := &http.Server{
 			Addr:      host,
 			Handler:   c.Handler(api),
 			TLSConfig: cfg,
 			ErrorLog:  stdlog.New(logwriter, "", 0),
 		}
-		log.WithFields(log.Fields{"host": host, "domain": Config.API.Domain}).Info("Listening HTTPS, using certificate from autocert")
+		log.WithFields(log.Fields{"host": host, "domain": Config.General.Domain}).Info("Listening HTTPS")
+		err = srv.ListenAndServeTLS("", "")
+	case "letsencrypt":
+		magicconf.CA = certmagic.LetsEncryptProductionCA
+		certcfg := certmagic.New(cache, magicconf)
+		err = certcfg.ManageSync([]string{Config.General.Domain})
+		if err != nil {
+			errChan <- err
+			return
+		}
+		cfg.GetCertificate = certcfg.GetCertificate
+		srv := &http.Server{
+			Addr:      host,
+			Handler:   c.Handler(api),
+			TLSConfig: cfg,
+			ErrorLog:  stdlog.New(logwriter, "", 0),
+		}
+		log.WithFields(log.Fields{"host": host, "domain": Config.General.Domain}).Info("Listening HTTPS")
 		err = srv.ListenAndServeTLS("", "")
 	case "cert":
 		srv := &http.Server{
